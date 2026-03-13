@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 
 import requests
 from dotenv import load_dotenv
-from telegram import PhotoSize, Update
+from telegram import BotCommand, PhotoSize, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
@@ -194,16 +194,16 @@ def _build_vision_messages(
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
     image_data_url = f"data:{mime_type};base64,{image_b64}"
     instruction = (
-        "请做图片OCR+视觉理解，回答简洁。\n"
+        "请做图片视觉理解，回答简洁。\n"
         f"上文：{_trim_text(prev_text)}\n"
         f"下文：{_trim_text(next_text)}\n"
         f"备注：{_trim_text(caption)}\n"
-        "输出格式：\n1) OCR文本（若无写“无明显文字”）\n2) 画面内容\n3) 结合上下文的回复"
+        "输出格式：\n1) 画面内容\n2) 结合上下文的回复"
     )
     return [
         {
             "role": "system",
-            "content": "你是支持OCR与视觉理解的中文助手。",
+            "content": "你是支持视觉理解的中文助手。",
         },
         {
             "role": "user",
@@ -240,10 +240,10 @@ def _stream_chat_completions(messages: list[dict[str, Any]]) -> str:
                 stream=True,
             ) as resp:
                 resp.raise_for_status()
-                for raw_line in resp.iter_lines(decode_unicode=True):
+                for raw_line in resp.iter_lines(decode_unicode=False):
                     if not raw_line:
                         continue
-                    line = raw_line.strip()
+                    line = raw_line.decode("utf-8", errors="ignore").strip()
                     if not line.startswith("data:"):
                         continue
                     data = line[5:].strip()
@@ -413,7 +413,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "2) 支持多轮上下文对话。\n"
         "3) /new 与 /refresh 可清空上下文。\n"
         "4) 已启用 AI 请求队列 + 自动限速防封。\n"
-        "5) 图片支持 OCR + 视觉理解。"
+        "5) 图片支持视觉理解。"
     )
 
 
@@ -548,7 +548,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "prev_text": prev_text,
             "caption": caption,
         }
-        await update.message.reply_text("已收到你的图片。请再发送一句补充描述，我会做 OCR + 视觉联合分析。")
+        await update.message.reply_text("已收到你的图片。请再发送一句补充描述，我会做视觉联合分析。")
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -586,6 +586,15 @@ async def post_init(app: Application) -> None:
     for _ in range(max(1, AI_QUEUE_WORKERS)):
         workers.append(asyncio.create_task(ai_worker()))
     app.bot_data["ai_workers"] = workers
+
+    await app.bot.set_my_commands(
+        [
+            BotCommand("start", "开始使用"),
+            BotCommand("help", "查看帮助"),
+            BotCommand("new", "开启新对话"),
+            BotCommand("refresh", "刷新并清空上下文"),
+        ]
+    )
 
 
 async def post_shutdown(app: Application) -> None:
