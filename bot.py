@@ -1,12 +1,15 @@
 import asyncio
+import base64
 import logging
+import mimetypes
 import os
 import sqlite3
 import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import requests
+from dotenv import load_dotenv
 from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -17,6 +20,8 @@ from telegram.ext import (
     filters,
 )
 
+
+load_dotenv()
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -29,6 +34,8 @@ BOT_PASSWORD = os.getenv("BOT_PASSWORD", "")
 AI_API_KEY = os.getenv("AI_API_KEY", "")
 AI_API_BASE = os.getenv("AI_API_BASE", "https://api.openai.com/v1").rstrip("/")
 AI_MODEL = os.getenv("AI_MODEL", "gpt-4o-mini")
+AI_TIMEOUT = int(os.getenv("AI_TIMEOUT", "120"))
+AI_TEMPERATURE = float(os.getenv("AI_TEMPERATURE", "0.3"))
 DB_PATH = os.getenv("DB_PATH", "users.db")
 
 
@@ -78,8 +85,28 @@ class AuthStore:
 store = AuthStore(DB_PATH)
 
 
-def ask_ai(user_input: str) -> str:
-    """Call third-party AI API (OpenAI-compatible Chat Completions)."""
+def _extract_content(data: dict[str, Any]) -> str:
+    choices = data.get("choices", [])
+    if not choices:
+        return "⚠️ AI 返回为空。"
+
+    content = choices[0].get("message", {}).get("content", "")
+    if isinstance(content, str):
+        return content.strip()
+
+    if isinstance(content, list):
+        chunks = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                text = part.get("text", "")
+                if text:
+                    chunks.append(text)
+        return "\n".join(chunks).strip() or "⚠️ AI 未返回文本内容。"
+
+    return str(content).strip() or "⚠️ AI 未返回有效内容。"
+
+
+def _call_chat_completions(messages: list[dict[str, Any]]) -> str:
     if not AI_API_KEY:
         return "⚠️ 未配置 AI_API_KEY，暂时无法调用 AI。"
 
@@ -88,26 +115,70 @@ def ask_ai(user_input: str) -> str:
         "Authorization": f"Bearer {AI_API_KEY}",
         "Content-Type": "application/json",
     }
-    payload = {
+    payload: dict[str, Any] = {
         "model": AI_MODEL,
-        "messages": [
-            {
-                "role": "system",
-                "content": "你是一个有帮助的 Telegram 助手，请使用简体中文回答。",
-            },
-            {"role": "user", "content": user_input},
-        ],
-        "temperature": 0.7,
+        "messages": messages,
+        "temperature": AI_TEMPERATURE,
     }
 
     try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=60)
+        resp = requests.post(url, headers=headers, json=payload, timeout=AI_TIMEOUT)
         resp.raise_for_status()
-        data = resp.json()
-        return data["choices"][0]["message"]["content"].strip()
-    except Exception as exc:
+        return _extract_content(resp.json())
+    except requests.HTTPError as exc:
+        detail = ""
+        if exc.response is not None:
+            detail = exc.response.text[:300]
+        logger.exception("AI API HTTP error: %s", exc)
+        return f"⚠️ 调用 AI 失败：HTTP {exc.response.status_code if exc.response else 'unknown'} {detail}"
+    except requests.RequestException as exc:
         logger.exception("AI API request failed: %s", exc)
         return f"⚠️ 调用 AI 失败：{exc}"
+
+
+def ask_ai_text(user_input: str) -> str:
+    messages: list[dict[str, Any]] = [
+        {
+            "role": "system",
+            "content": "你是一个有帮助的 Telegram 助手，请使用简体中文回答。",
+        },
+        {"role": "user", "content": user_input},
+    ]
+    return _call_chat_completions(messages)
+
+
+def ask_ai_vision(
+    image_bytes: bytes,
+    mime_type: str,
+    prev_text: str,
+    next_text: str,
+    caption: str,
+) -> str:
+    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+    image_data_url = f"data:{mime_type};base64,{image_b64}"
+
+    instruction = (
+        "你将收到一张用户图片，请识别图片内容并结合上下文回答。\n"
+        f"用户上一句：{prev_text or '（无）'}\n"
+        f"用户下一句：{next_text or '（无）'}\n"
+        f"图片备注（caption）：{caption or '（无）'}\n"
+        "请输出：1) 图片内容概述 2) 结合上下文给出简短回复。"
+    )
+
+    messages: list[dict[str, Any]] = [
+        {
+            "role": "system",
+            "content": "你是支持图像理解的中文 AI 助手，请准确识图并简明回答。",
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": instruction},
+                {"type": "image_url", "image_url": {"url": image_data_url}},
+            ],
+        },
+    ]
+    return _call_chat_completions(messages)
 
 
 def is_authorized(user_id: Optional[int]) -> bool:
@@ -119,7 +190,7 @@ def is_authorized(user_id: Optional[int]) -> bool:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id if update.effective_user else None
-    if user_id is None:
+    if user_id is None or update.message is None:
         return
 
     store.ensure_user(user_id)
@@ -132,11 +203,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None:
+        return
     await update.message.reply_text(
         "使用说明：\n"
         "1) 首次聊天需要输入密码认证。\n"
-        "2) 认证后可直接发送文字，我会调用第三方 AI 回复。\n"
-        "3) 也可以发送图片或文件，我会接收并回传确认。"
+        "2) 认证后可发送文字，调用第三方 AI 回复。\n"
+        "3) 发送图片时，我会用可识图模型识别图片，并附带你上下句文本一起分析。\n"
+        "4) 发送文件时，我会接收并回传确认。"
     )
 
 
@@ -164,9 +238,28 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await update.message.reply_text("❌ 密码错误，请重新输入。")
         return
 
+    pending_photo = context.user_data.get("pending_photo")
+    if pending_photo:
+        context.user_data["pending_photo"] = None
+        await context.bot.send_chat_action(
+            chat_id=update.effective_chat.id, action=ChatAction.TYPING
+        )
+        ai_reply = await asyncio.to_thread(
+            ask_ai_vision,
+            pending_photo["image_bytes"],
+            pending_photo["mime_type"],
+            pending_photo.get("prev_text", ""),
+            text,
+            pending_photo.get("caption", ""),
+        )
+        await update.message.reply_text(f"已收到你的图片。\nAI：{ai_reply}")
+        context.user_data["last_text"] = text
+        return
+
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-    ai_reply = await asyncio.to_thread(ask_ai, text)
+    ai_reply = await asyncio.to_thread(ask_ai_text, text)
     await update.message.reply_text(ai_reply)
+    context.user_data["last_text"] = text
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -179,18 +272,33 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     photo = update.message.photo[-1]
-    file = await photo.get_file()
+    tg_file = await photo.get_file()
+    image_bytes = bytes(await tg_file.download_as_bytearray())
+    caption = (update.message.caption or "").strip()
+    prev_text = (context.user_data.get("last_text") or "").strip()
 
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        local_path = Path(tmp_dir) / f"photo_{photo.file_unique_id}.jpg"
-        await file.download_to_drive(custom_path=str(local_path))
+    mime_type = "image/jpeg"
+    if tg_file.file_path:
+        guessed_mime, _ = mimetypes.guess_type(tg_file.file_path)
+        if guessed_mime:
+            mime_type = guessed_mime
 
-        user_caption = update.message.caption or ""
-        summary_prompt = f"用户上传了一张图片。附带说明：{user_caption or '无'}。请给出简短回复。"
-        ai_reply = await asyncio.to_thread(ask_ai, summary_prompt)
-
-        with local_path.open("rb") as f:
-            await update.message.reply_photo(photo=f, caption=f"已收到你的图片。\nAI：{ai_reply}")
+    if caption:
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+        ai_reply = await asyncio.to_thread(
+            ask_ai_vision, image_bytes, mime_type, prev_text, caption, caption
+        )
+        await update.message.reply_text(f"已收到你的图片。\nAI：{ai_reply}")
+    else:
+        context.user_data["pending_photo"] = {
+            "image_bytes": image_bytes,
+            "mime_type": mime_type,
+            "prev_text": prev_text,
+            "caption": caption,
+        }
+        await update.message.reply_text(
+            "已收到你的图片。请再发送一句补充描述，我会结合你上一句和这句一起识图分析。"
+        )
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -217,7 +325,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             f"用户上传了文件：{filename}，大小约 {document.file_size or 0} 字节。"
             "请生成一句简短确认消息。"
         )
-        ai_reply = await asyncio.to_thread(ask_ai, prompt)
+        ai_reply = await asyncio.to_thread(ask_ai_text, prompt)
 
         with local_path.open("rb") as f:
             await update.message.reply_document(
