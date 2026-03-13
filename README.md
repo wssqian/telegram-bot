@@ -1,45 +1,38 @@
-# Telegram AI Bot（含首次密码验证 + 图片识别 + 文件支持）
+# Telegram AI Bot（多轮上下文 + 流式回复 + 队列 + OCR视觉）
 
-这个项目实现了一个 Telegram Bot，具备以下功能：
+功能：
 
-- 接入第三方 AI API（OpenAI 兼容接口）
-- 新用户首次对话必须输入密码验证
-- 支持图片识别（视觉模型）
-- 图片分析附带“上一句 + 下一句（或 caption）”上下文（自动截断）
-- 支持接收文件并回传确认
-- 支持 `/new` 开新对话、`/refresh` 刷新上下文
+- 第一次聊天密码验证
+- 多轮上下文对话（可 `/new`、`/refresh` 清空）
+- AI 流式回复（兼容失败自动回退普通请求）
+- AI 请求队列（多 worker）
+- 自动限速防封（每用户窗口限流）
+- 图片 OCR + 视觉分析（可结合上下文）
+- Telegram 连接池调大 + Telegram 走代理、AI 本地直连
 
-## 1. 安装依赖
+## 1. 安装
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## 2. 配置环境变量（支持直接读取 `.env`）
+## 2. 配置
 
 ```bash
 cp .env.example .env
 ```
 
-程序启动时会自动 `load_dotenv()`，无需手动 `export`。
+程序会自动读取 `.env`。
 
-`.env` 示例：
+关键参数：
 
-```env
-TELEGRAM_BOT_TOKEN=<你的telegram token>
-BOT_PASSWORD=<首次聊天密码>
-AI_API_KEY=<第三方AI token>
-AI_API_BASE=http://192.168.1.99:9870/v1
-AI_MODEL=gpt-4o-mini
-AI_TIMEOUT=120
-AI_TEMPERATURE=0.3
-AI_MAX_CONTEXT_CHARS=120
-AI_MAX_IMAGE_BYTES=350000
-AI_RETRY_502=2
-AI_BYPASS_PROXY_FOR_LOCAL=true
-TELEGRAM_PROXY_URL=http://127.0.0.1:7890
-DB_PATH=users.db
-```
+- `AI_STREAM=true`：启用流式。
+- `AI_QUEUE_WORKERS=2`：AI 请求队列 worker 数。
+- `AI_MAX_HISTORY_TURNS=8`：多轮上下文轮数。
+- `RATE_LIMIT_WINDOW_SECONDS` + `RATE_LIMIT_MAX_REQUESTS`：自动限速。
+- `TELEGRAM_POOL_SIZE=32`：Telegram HTTP 连接池。
+- `TELEGRAM_PROXY_URL=http://127.0.0.1:7890`：仅 Telegram 走代理。
+- `AI_BYPASS_PROXY_FOR_LOCAL=true`：本地 AI 地址不走代理。
 
 ## 3. 启动
 
@@ -47,21 +40,15 @@ DB_PATH=users.db
 python bot.py
 ```
 
-## 4. 使用方式
+## 4. 命令
 
-- `/start`：首次使用会提示输入密码。
-- `/new`：开启新对话（清空缓存上下文）。
-- `/refresh`：刷新聊天（清空缓存上下文）。
-- 认证后发送文本：Bot 调用 AI 返回回复。
-- 认证后发送图片：
-  - 若带 caption：直接识图并结合上下文回复。
-  - 若不带 caption：Bot 会提示你再发一句；随后将“上一句 + 这句 + 图片”一起发给视觉模型。
-- 认证后发送文件：Bot 接收后回传文件，并给出 AI 确认文案。
+- `/start`：开始
+- `/help`：帮助
+- `/new`：开启新对话（清空上下文）
+- `/refresh`：刷新聊天（清空上下文）
 
-## 5. 502 与代理说明
+## 5. 说明
 
-- Bot 支持对 `502/503/504` 自动重试（`AI_RETRY_502`）。
-- 若你看到 502 但 AI 后台无请求记录，常见原因是上游网关/代理链路失败，不一定到达模型服务。
-- 现在支持“Telegram 走代理、AI 本地接口直连”：
-  - `TELEGRAM_PROXY_URL=http://127.0.0.1:7890` 仅用于 Telegram API。
-  - `AI_BYPASS_PROXY_FOR_LOCAL=true` 时，本地网段 AI 地址（如 `192.168.x.x`）不会走代理。
+- 图片消息将进行 OCR + 视觉联合理解。
+- 如果图片无 caption，机器人会要求再发一句文本，随后合并分析。
+- 队列可避免高并发下直接压垮后端模型。
