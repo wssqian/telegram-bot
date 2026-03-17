@@ -1,20 +1,25 @@
 import asyncio
 import base64
 import ipaddress
+import json
 import logging
 import mimetypes
 import os
+import re
 import sqlite3
+import subprocess
 import tempfile
 import time
 from collections import deque
 from dataclasses import dataclass
+from html import unescape
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import urlparse
+from urllib.parse import quote_plus, urlparse
 
 import requests
 from dotenv import load_dotenv
+from openpyxl import load_workbook
 from telegram import BotCommand, PhotoSize, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -54,6 +59,8 @@ AI_BYPASS_PROXY_FOR_LOCAL = os.getenv("AI_BYPASS_PROXY_FOR_LOCAL", "true").lower
 AI_STREAM = os.getenv("AI_STREAM", "true").lower() in {"1", "true", "yes", "on"}
 AI_QUEUE_WORKERS = int(os.getenv("AI_QUEUE_WORKERS", "2"))
 AI_MAX_HISTORY_TURNS = int(os.getenv("AI_MAX_HISTORY_TURNS", "8"))
+AI_TOOL_MAX_STEPS = int(os.getenv("AI_TOOL_MAX_STEPS", "6"))
+AI_ENABLE_TOOLS = os.getenv("AI_ENABLE_TOOLS", "true").lower() in {"1", "true", "yes", "on"}
 
 TELEGRAM_PROXY_URL = os.getenv("TELEGRAM_PROXY_URL", "http://127.0.0.1:7890")
 TELEGRAM_POOL_SIZE = int(os.getenv("TELEGRAM_POOL_SIZE", "32"))
@@ -64,6 +71,24 @@ TELEGRAM_WRITE_TIMEOUT = float(os.getenv("TELEGRAM_WRITE_TIMEOUT", "20"))
 RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "30"))
 RATE_LIMIT_MAX_REQUESTS = int(os.getenv("RATE_LIMIT_MAX_REQUESTS", "8"))
 DB_PATH = os.getenv("DB_PATH", "users.db")
+SKILLS_DIR = Path(os.getenv("SKILLS_DIR", "skills"))
+FILES_DIR = Path(os.getenv("FILES_DIR", "files"))
+
+
+BUILTIN_SKILLS: dict[str, str] = {
+    "coder": (
+        "你是一个编程助理。优先输出可运行代码。"
+        "当需要外部信息时可调用 web_search；当需要计算/脚本时可调用 run_python。"
+    ),
+    "research": (
+        "你是一个研究助理。先检索资料，再给结构化结论。"
+        "尽量给出来源链接并说明不确定性。"
+    ),
+    "xlsx-analyst": (
+        "你是表格分析助理。优先调用 read_xlsx 查看内容，再做分析。"
+        "输出要包含关键数据摘要与结论。"
+    ),
+}
 
 
 class AuthStore:
@@ -131,7 +156,8 @@ def _extract_content(data: dict[str, Any]) -> str:
     if not choices:
         return "⚠️ AI 返回为空。"
 
-    content = choices[0].get("message", {}).get("content", "")
+    msg = choices[0].get("message", {})
+    content = msg.get("content", "")
     if isinstance(content, str):
         return content.strip()
 
@@ -168,19 +194,32 @@ def _get_request_proxies(url: str) -> Optional[dict[str, Optional[str]]]:
     return None
 
 
-def _build_text_messages(user_text: str, history: list[dict[str, str]]) -> list[dict[str, Any]]:
-    messages: list[dict[str, Any]] = [
-        {
-            "role": "system",
-            "content": "你是一个有帮助的 Telegram 助手，请使用简体中文回答。",
-        }
-    ]
+def _skill_system_prompt(skill_name: str) -> str:
+    if not skill_name:
+        return ""
+    skill_file = SKILLS_DIR / f"{skill_name}.txt"
+    if not skill_file.exists():
+        return ""
+    try:
+        return skill_file.read_text(encoding="utf-8").strip()
+    except Exception:
+        return ""
+
+
+def _build_text_messages(
+    user_text: str, history: list[dict[str, str]], skill_name: str = ""
+) -> list[dict[str, Any]]:
+    base_prompt = "你是一个有帮助的 Telegram 助手，请使用简体中文回答。"
+    skill_prompt = _skill_system_prompt(skill_name)
+    system_content = base_prompt if not skill_prompt else f"{base_prompt}\n\n当前技能({skill_name})：{skill_prompt}"
+
+    messages: list[dict[str, Any]] = [{"role": "system", "content": system_content}]
     for item in history[-AI_MAX_HISTORY_TURNS * 2 :]:
         role = item.get("role")
         content = item.get("content", "")
         if role in {"user", "assistant"} and content:
-            messages.append({"role": role, "content": _trim_text(content, 1200)})
-    messages.append({"role": "user", "content": _trim_text(user_text, 1200)})
+            messages.append({"role": role, "content": _trim_text(content, 1600)})
+    messages.append({"role": "user", "content": _trim_text(user_text, 1600)})
     return messages
 
 
@@ -201,10 +240,7 @@ def _build_vision_messages(
         "输出格式：\n1) 画面内容\n2) 结合上下文的回复"
     )
     return [
-        {
-            "role": "system",
-            "content": "你是支持视觉理解的中文助手。",
-        },
+        {"role": "system", "content": "你是支持视觉理解的中文助手。"},
         {
             "role": "user",
             "content": [
@@ -215,12 +251,23 @@ def _build_vision_messages(
     ]
 
 
-def _stream_chat_completions(messages: list[dict[str, Any]]) -> str:
+def _chat_request(payload: dict[str, Any], *, stream: bool = False):
     url = f"{AI_API_BASE}/chat/completions"
     headers = {
         "Authorization": f"Bearer {AI_API_KEY}",
         "Content-Type": "application/json",
     }
+    return requests.post(
+        url,
+        headers=headers,
+        json=payload,
+        timeout=AI_TIMEOUT,
+        proxies=_get_request_proxies(url),
+        stream=stream,
+    )
+
+
+def _stream_chat_completions(messages: list[dict[str, Any]]) -> str:
     payload: dict[str, Any] = {
         "model": AI_MODEL,
         "messages": messages,
@@ -231,14 +278,7 @@ def _stream_chat_completions(messages: list[dict[str, Any]]) -> str:
     for idx in range(attempts):
         try:
             chunks: list[str] = []
-            with requests.post(
-                url,
-                headers=headers,
-                json=payload,
-                timeout=AI_TIMEOUT,
-                proxies=_get_request_proxies(url),
-                stream=True,
-            ) as resp:
+            with _chat_request(payload, stream=True) as resp:
                 resp.raise_for_status()
                 for raw_line in resp.iter_lines(decode_unicode=False):
                     if not raw_line:
@@ -250,7 +290,7 @@ def _stream_chat_completions(messages: list[dict[str, Any]]) -> str:
                     if data == "[DONE]":
                         break
                     try:
-                        obj = requests.models.complexjson.loads(data)
+                        obj = json.loads(data)
                     except ValueError:
                         continue
                     delta = obj.get("choices", [{}])[0].get("delta", {})
@@ -264,9 +304,7 @@ def _stream_chat_completions(messages: list[dict[str, Any]]) -> str:
         except requests.HTTPError as exc:
             status = exc.response.status_code if exc.response is not None else None
             if status in {502, 503, 504} and idx < attempts - 1:
-                wait_s = min(2.5, 0.8 * (idx + 1))
-                logger.warning("AI stream gateway %s, retrying in %.1fs", status, wait_s)
-                time.sleep(wait_s)
+                time.sleep(min(2.5, 0.8 * (idx + 1)))
                 continue
             detail = exc.response.text[:240] if exc.response is not None else ""
             logger.exception("AI stream HTTP error: %s", exc)
@@ -286,11 +324,6 @@ def _call_chat_completions(messages: list[dict[str, Any]]) -> str:
         if not streamed.startswith("⚠️ 调用 AI 失败"):
             return streamed
 
-    url = f"{AI_API_BASE}/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {AI_API_KEY}",
-        "Content-Type": "application/json",
-    }
     payload: dict[str, Any] = {
         "model": AI_MODEL,
         "messages": messages,
@@ -300,21 +333,13 @@ def _call_chat_completions(messages: list[dict[str, Any]]) -> str:
     attempts = max(1, AI_RETRY_502 + 1)
     for idx in range(attempts):
         try:
-            resp = requests.post(
-                url,
-                headers=headers,
-                json=payload,
-                timeout=AI_TIMEOUT,
-                proxies=_get_request_proxies(url),
-            )
+            resp = _chat_request(payload)
             resp.raise_for_status()
             return _extract_content(resp.json())
         except requests.HTTPError as exc:
             status = exc.response.status_code if exc.response is not None else None
             if status in {502, 503, 504} and idx < attempts - 1:
-                wait_s = min(2.5, 0.8 * (idx + 1))
-                logger.warning("AI gateway %s, retrying in %.1fs", status, wait_s)
-                time.sleep(wait_s)
+                time.sleep(min(2.5, 0.8 * (idx + 1)))
                 continue
             detail = exc.response.text[:240] if exc.response is not None else ""
             logger.exception("AI API HTTP error: %s", exc)
@@ -323,6 +348,239 @@ def _call_chat_completions(messages: list[dict[str, Any]]) -> str:
             logger.exception("AI API request failed: %s", exc)
             return f"⚠️ 调用 AI 失败：{exc}"
     return "⚠️ 调用 AI 失败：网关繁忙，请稍后重试。"
+
+
+def _tool_web_search(query: str, max_results: int = 5) -> str:
+    max_results = max(1, min(max_results, 10))
+    url = f"https://duckduckgo.com/html/?q={quote_plus(query)}"
+    try:
+        resp = requests.get(url, timeout=20)
+        resp.raise_for_status()
+        html = resp.text
+        matches = re.findall(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>', html)
+        out = []
+        for idx, (link, title_html) in enumerate(matches[:max_results], 1):
+            title = re.sub(r"<.*?>", "", unescape(title_html)).strip()
+            out.append(f"{idx}. {title}\n{unescape(link)}")
+        return "\n\n".join(out) if out else "未检索到结果。"
+    except Exception as exc:  # noqa: BLE001
+        return f"搜索失败：{exc}"
+
+
+def _tool_read_xlsx(path: str, sheet_name: str = "", max_rows: int = 30) -> str:
+    target = (FILES_DIR / path).resolve() if not Path(path).is_absolute() else Path(path).resolve()
+    if not str(target).startswith(str(FILES_DIR.resolve())) and not Path(path).is_absolute():
+        return "路径非法，仅允许读取 FILES_DIR 下文件。"
+    if not target.exists():
+        return f"文件不存在：{target}"
+    if target.suffix.lower() not in {".xlsx", ".xlsm", ".xltx", ".xltm"}:
+        return "文件不是 xlsx 格式。"
+
+    wb = load_workbook(target, read_only=True, data_only=True)
+    ws = wb[sheet_name] if sheet_name and sheet_name in wb.sheetnames else wb[wb.sheetnames[0]]
+    lines = [f"sheet={ws.title}"]
+    for idx, row in enumerate(ws.iter_rows(values_only=True), 1):
+        if idx > max_rows:
+            lines.append("...已截断...")
+            break
+        vals = ["" if v is None else str(v) for v in row]
+        lines.append("\t".join(vals))
+    return "\n".join(lines)
+
+
+def _tool_list_files(subdir: str = ".", max_items: int = 100) -> str:
+    base = (FILES_DIR / subdir).resolve()
+    if not str(base).startswith(str(FILES_DIR.resolve())):
+        return "路径非法。"
+    if not base.exists():
+        return "目录不存在。"
+    items = []
+    for p in sorted(base.iterdir())[:max_items]:
+        items.append(("[D]" if p.is_dir() else "[F]") + f" {p.name}")
+    return "\n".join(items) if items else "目录为空。"
+
+
+def _tool_read_text(path: str, max_chars: int = 4000) -> str:
+    target = (FILES_DIR / path).resolve() if not Path(path).is_absolute() else Path(path).resolve()
+    if not str(target).startswith(str(FILES_DIR.resolve())) and not Path(path).is_absolute():
+        return "路径非法，仅允许读取 FILES_DIR 下文件。"
+    if not target.exists():
+        return f"文件不存在：{target}"
+    try:
+        return target.read_text(encoding="utf-8", errors="ignore")[:max_chars]
+    except Exception as exc:  # noqa: BLE001
+        return f"读取失败：{exc}"
+
+
+def _tool_run_python(code: str, timeout_s: int = 8) -> str:
+    timeout_s = max(1, min(timeout_s, 20))
+    try:
+        proc = subprocess.run(
+            ["python", "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
+        out = (proc.stdout or "")[:6000]
+        err = (proc.stderr or "")[:3000]
+        return f"exit={proc.returncode}\nstdout:\n{out}\nstderr:\n{err}"
+    except Exception as exc:  # noqa: BLE001
+        return f"执行失败：{exc}"
+
+
+def _tool_specs() -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "联网搜索网页结果（DuckDuckGo）",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "max_results": {"type": "integer", "default": 5},
+                    },
+                    "required": ["query"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_files",
+                "description": "列出 FILES_DIR 下目录内容",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "subdir": {"type": "string", "default": "."},
+                        "max_items": {"type": "integer", "default": 100},
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "read_text",
+                "description": "读取文本文件",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "max_chars": {"type": "integer", "default": 4000},
+                    },
+                    "required": ["path"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "read_xlsx",
+                "description": "读取 xlsx 文件并输出前若干行",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "sheet_name": {"type": "string", "default": ""},
+                        "max_rows": {"type": "integer", "default": 30},
+                    },
+                    "required": ["path"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "run_python",
+                "description": "执行短 Python 代码片段",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "code": {"type": "string"},
+                        "timeout_s": {"type": "integer", "default": 8},
+                    },
+                    "required": ["code"],
+                },
+            },
+        },
+    ]
+
+
+def _exec_tool(name: str, args: dict[str, Any]) -> str:
+    if name == "web_search":
+        return _tool_web_search(args.get("query", ""), int(args.get("max_results", 5)))
+    if name == "list_files":
+        return _tool_list_files(args.get("subdir", "."), int(args.get("max_items", 100)))
+    if name == "read_text":
+        return _tool_read_text(args.get("path", ""), int(args.get("max_chars", 4000)))
+    if name == "read_xlsx":
+        return _tool_read_xlsx(
+            args.get("path", ""),
+            args.get("sheet_name", ""),
+            int(args.get("max_rows", 30)),
+        )
+    if name == "run_python":
+        return _tool_run_python(args.get("code", ""), int(args.get("timeout_s", 8)))
+    return f"未知工具：{name}"
+
+
+def _call_chat_with_tools(messages: list[dict[str, Any]]) -> str:
+    if not AI_API_KEY:
+        return "⚠️ 未配置 AI_API_KEY，暂时无法调用 AI。"
+
+    tool_messages = list(messages)
+    for _ in range(max(1, AI_TOOL_MAX_STEPS)):
+        payload = {
+            "model": AI_MODEL,
+            "messages": tool_messages,
+            "temperature": AI_TEMPERATURE,
+            "tools": _tool_specs(),
+            "tool_choice": "auto",
+        }
+        try:
+            resp = _chat_request(payload)
+            resp.raise_for_status()
+            data = resp.json()
+        except requests.RequestException as exc:
+            return f"⚠️ 调用 AI 失败：{exc}"
+
+        choices = data.get("choices", [])
+        if not choices:
+            return "⚠️ AI 返回为空。"
+
+        msg = choices[0].get("message", {})
+        tool_calls = msg.get("tool_calls") or []
+        if not tool_calls:
+            return _extract_content(data)
+
+        assistant_msg = {
+            "role": "assistant",
+            "content": msg.get("content", ""),
+            "tool_calls": tool_calls,
+        }
+        tool_messages.append(assistant_msg)
+
+        for tc in tool_calls:
+            fn = tc.get("function", {})
+            name = fn.get("name", "")
+            raw_args = fn.get("arguments", "{}")
+            try:
+                args = json.loads(raw_args) if raw_args else {}
+            except json.JSONDecodeError:
+                args = {}
+            result = _exec_tool(name, args)
+            tool_messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tc.get("id", ""),
+                    "name": name,
+                    "content": _trim_text(result, 12000),
+                }
+            )
+
+    return "⚠️ 工具调用步数超限，请缩小问题范围后重试。"
 
 
 async def enqueue_ai_job(mode: str, payload: dict[str, Any]) -> str:
@@ -340,7 +598,12 @@ async def ai_worker() -> None:
                 messages = _build_text_messages(
                     job.payload.get("text", ""),
                     job.payload.get("history", []),
+                    job.payload.get("skill_name", ""),
                 )
+                if AI_ENABLE_TOOLS:
+                    result = await asyncio.to_thread(_call_chat_with_tools, messages)
+                else:
+                    result = await asyncio.to_thread(_call_chat_completions, messages)
             else:
                 messages = _build_vision_messages(
                     job.payload["image_bytes"],
@@ -349,7 +612,7 @@ async def ai_worker() -> None:
                     job.payload.get("next_text", ""),
                     job.payload.get("caption", ""),
                 )
-            result = await asyncio.to_thread(_call_chat_completions, messages)
+                result = await asyncio.to_thread(_call_chat_completions, messages)
             if not job.future.done():
                 job.future.set_result(result)
         except Exception as exc:  # noqa: BLE001
@@ -391,6 +654,11 @@ def _reset_chat_context(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data["history"] = []
 
 
+def _ensure_dirs() -> None:
+    SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+    FILES_DIR.mkdir(parents=True, exist_ok=True)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id if update.effective_user else None
     if user_id is None or update.message is None:
@@ -412,8 +680,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "1) 首次聊天需要输入密码认证。\n"
         "2) 支持多轮上下文对话。\n"
         "3) /new 与 /refresh 可清空上下文。\n"
-        "4) 已启用 AI 请求队列 + 自动限速防封。\n"
-        "5) 图片支持视觉理解。"
+        "4) 支持技能：/skill_list /skill_install <name> /skill_use <name> /skill_off。\n"
+        "5) 工具能力：联网搜索、读取 xlsx、读取文件、执行 Python。"
     )
 
 
@@ -429,6 +697,56 @@ async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     _reset_chat_context(context)
     await update.message.reply_text("🔄 聊天已刷新，上下文已清空。")
+
+
+async def skill_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None:
+        return
+    _ensure_dirs()
+    names = sorted(p.stem for p in SKILLS_DIR.glob("*.txt"))
+    builtins = ", ".join(sorted(BUILTIN_SKILLS.keys()))
+    current = context.user_data.get("skill_name", "无")
+    text = "\n".join(names) if names else "(无已安装技能)"
+    await update.message.reply_text(
+        f"当前技能：{current}\n\n已安装技能：\n{text}\n\n可安装内置技能：{builtins}"
+    )
+
+
+async def skill_install_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None:
+        return
+    _ensure_dirs()
+    if not context.args:
+        await update.message.reply_text("用法：/skill_install coder|research|xlsx-analyst")
+        return
+    name = context.args[0].strip().lower()
+    prompt = BUILTIN_SKILLS.get(name)
+    if not prompt:
+        await update.message.reply_text("内置技能不存在，可用：coder, research, xlsx-analyst")
+        return
+    (SKILLS_DIR / f"{name}.txt").write_text(prompt, encoding="utf-8")
+    await update.message.reply_text(f"✅ 已安装技能：{name}")
+
+
+async def skill_use_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None:
+        return
+    if not context.args:
+        await update.message.reply_text("用法：/skill_use <skill_name>")
+        return
+    name = context.args[0].strip()
+    if not (SKILLS_DIR / f"{name}.txt").exists():
+        await update.message.reply_text(f"技能不存在：{name}，先 /skill_install 或手动放入 {SKILLS_DIR}")
+        return
+    context.user_data["skill_name"] = name
+    await update.message.reply_text(f"✅ 已启用技能：{name}")
+
+
+async def skill_off_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None:
+        return
+    context.user_data.pop("skill_name", None)
+    await update.message.reply_text("已关闭技能，恢复默认助手模式。")
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -476,9 +794,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(f"已收到你的图片。\nAI：{ai_reply}")
         return
 
-    placeholder = await update.message.reply_text("⏳ AI 正在流式回复中...")
+    placeholder = await update.message.reply_text("⏳ AI 正在回复中...")
     history = context.user_data.get("history", [])
-    ai_reply = await enqueue_ai_job("text", {"text": text, "history": history})
+    skill_name = context.user_data.get("skill_name", "")
+    ai_reply = await enqueue_ai_job(
+        "text", {"text": text, "history": history, "skill_name": skill_name}
+    )
 
     if ai_reply and not ai_reply.startswith("⚠️"):
         history.append({"role": "user", "content": text})
@@ -494,7 +815,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         else:
             await update.message.reply_text(chunk)
         if idx < len(chunks) - 1:
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.15)
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -574,14 +895,22 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         local_path = Path(tmp_dir) / filename
         await tg_file.download_to_drive(custom_path=str(local_path))
 
-        prompt = f"用户上传了文件：{filename}，大小约 {document.file_size or 0} 字节。请生成一句简短确认消息。"
+        prompt = (
+            f"用户上传了文件：{filename}，大小约 {document.file_size or 0} 字节。"
+            "请提示用户把文件放到 FILES_DIR 后可用 read_text/read_xlsx 工具读取分析。"
+        )
         ai_reply = await enqueue_ai_job("text", {"text": prompt, "history": []})
 
         with local_path.open("rb") as f:
-            await update.message.reply_document(document=f, caption=f"已收到并回传文件：{filename}\nAI：{ai_reply}")
+            await update.message.reply_document(
+                document=f,
+                caption=f"已收到并回传文件：{filename}\nAI：{ai_reply}",
+            )
 
 
 async def post_init(app: Application) -> None:
+    _ensure_dirs()
+
     workers: list[asyncio.Task[Any]] = []
     for _ in range(max(1, AI_QUEUE_WORKERS)):
         workers.append(asyncio.create_task(ai_worker()))
@@ -593,6 +922,10 @@ async def post_init(app: Application) -> None:
             BotCommand("help", "查看帮助"),
             BotCommand("new", "开启新对话"),
             BotCommand("refresh", "刷新并清空上下文"),
+            BotCommand("skill_list", "查看技能"),
+            BotCommand("skill_install", "安装内置技能"),
+            BotCommand("skill_use", "启用技能"),
+            BotCommand("skill_off", "关闭技能"),
         ]
     )
 
@@ -636,6 +969,10 @@ def main() -> None:
     app.add_handler(CommandHandler("new", new_chat_command))
     app.add_handler(CommandHandler("refresh", refresh_command))
     app.add_handler(CommandHandler("Refresh", refresh_command))
+    app.add_handler(CommandHandler("skill_list", skill_list_command))
+    app.add_handler(CommandHandler("skill_install", skill_install_command))
+    app.add_handler(CommandHandler("skill_use", skill_use_command))
+    app.add_handler(CommandHandler("skill_off", skill_off_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))

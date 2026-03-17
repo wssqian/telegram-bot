@@ -1,14 +1,13 @@
-# Telegram AI Bot（多轮上下文 + 流式回复 + 队列 + 视觉）
+# Telegram AI Bot（支持 Skill 安装/使用 + 工具调用）
 
 功能：
 
-- 第一次聊天密码验证
-- 多轮上下文对话（可 `/new`、`/refresh` 清空）
-- AI 流式回复（兼容失败自动回退普通请求）
-- AI 请求队列（多 worker）
-- 自动限速防封（每用户窗口限流）
-- 图片视觉分析（可结合上下文）
-- Telegram 连接池调大 + Telegram 走代理、AI 本地直连
+- 首次聊天密码验证
+- 多轮上下文对话（`/new`、`/refresh`）
+- AI 请求队列 + 限速防封 + 流式回复
+- 图片视觉理解
+- **Skill 安装与启用**
+- **工具调用（联网搜索 / 读取 xlsx / 读取文本 / 运行 Python）**
 
 ## 1. 安装
 
@@ -22,17 +21,12 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-程序会自动读取 `.env`。
-
 关键参数：
 
-- `AI_STREAM=true`：启用流式。
-- `AI_QUEUE_WORKERS=2`：AI 请求队列 worker 数。
-- `AI_MAX_HISTORY_TURNS=8`：多轮上下文轮数。
-- `RATE_LIMIT_WINDOW_SECONDS` + `RATE_LIMIT_MAX_REQUESTS`：自动限速。
-- `TELEGRAM_POOL_SIZE=32`：Telegram HTTP 连接池。
-- `TELEGRAM_PROXY_URL=http://127.0.0.1:7890`：仅 Telegram 走代理。
-- `AI_BYPASS_PROXY_FOR_LOCAL=true`：本地 AI 地址不走代理。
+- `AI_ENABLE_TOOLS=true`：开启工具调用。
+- `AI_TOOL_MAX_STEPS=6`：单次对话最多工具调用轮数。
+- `SKILLS_DIR=skills`：Skill 存放目录（`.txt`）。
+- `FILES_DIR=files`：可读取文件目录（xlsx/txt等）。
 
 ## 3. 启动
 
@@ -40,16 +34,19 @@ cp .env.example .env
 python bot.py
 ```
 
-## 4. 命令
+## 4. Skill 命令
 
-- `/start`：开始
-- `/help`：帮助
-- `/new`：开启新对话（清空上下文）
-- `/refresh`：刷新聊天（清空上下文）
+- `/skill_list`：查看已安装技能与当前技能。
+- `/skill_install coder|research|xlsx-analyst`：安装内置技能。
+- `/skill_use <name>`：启用技能。
+- `/skill_off`：关闭技能。
 
-## 5. 说明
+## 5. 可用工具（由 AI 自动选择调用）
 
-- 图片消息将进行视觉联合理解。
-- 如果图片无 caption，机器人会要求再发一句文本，随后合并分析。
-- 机器人会自动注册命令菜单（/start /help /new /refresh）。
-- 队列可避免高并发下直接压垮后端模型。
+- `web_search(query, max_results)`：联网搜索。
+- `list_files(subdir, max_items)`：列目录。
+- `read_text(path, max_chars)`：读文本。
+- `read_xlsx(path, sheet_name, max_rows)`：读 xlsx。
+- `run_python(code, timeout_s)`：执行短 Python 代码。
+
+> 建议把要分析的文档放到 `FILES_DIR`（默认 `files/`）里，例如 `files/report.xlsx`。
